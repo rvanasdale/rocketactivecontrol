@@ -1,0 +1,383 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <math.h>
+#include "SparkFun_ISM330DHCX.h"
+
+SparkFun_ISM330DHCX imu;
+sfe_ism_data_t accel;
+sfe_ism_data_t gyro;
+
+
+// Fin labels: (respective to IMU)
+Servo finRight;   // Pin 2: increasing pulse moves trailing edge down
+Servo finBottom;  // Pin 3: increasing pulse moves trailing edge left
+Servo finTop;     // Pin 4: increasing pulse moves trailing edge right
+Servo finLeft;    // Pin 5: increasing pulse moves trailing edge up
+
+
+const int CENTER_US = 1500; 
+const int MAX_OFFSET_US = 500; 
+
+
+const float MDPS_TO_DPS = 0.001f;
+const float RAD_TO_DEG_F = 57.2957795f;
+
+
+// Gains
+const float KP = 1.0f;
+const float KD = 0.1f;
+const float SERVO_GAIN = 5.0f;
+
+
+const float Q_ANGLE = 0.05f;
+const float Q_BIAS = 0.005f;
+
+
+struct AngleFilter {
+  float angle;
+  float bias;
+  float p00;
+  float p01;
+  float p10;
+  float p11;
+};
+
+
+AngleFilter topFilter = {};
+AngleFilter rightFilter = {};
+
+
+float gyroOffsetX = 0;
+float gyroOffsetZ = 0;
+
+
+unsigned long lastSampleUs = 0;
+unsigned long lastGoodMs = 0;
+unsigned long lastPrintMs = 0;
+
+
+void centerServos() {
+  finRight.writeMicroseconds(CENTER_US);
+  finBottom.writeMicroseconds(CENTER_US);
+  finTop.writeMicroseconds(CENTER_US);
+  finLeft.writeMicroseconds(CENTER_US);
+}
+
+
+int servoCommand(float offset) {
+  offset = constrain(
+    offset,
+    -(float)MAX_OFFSET_US,
+    (float)MAX_OFFSET_US
+  );
+
+
+  return CENTER_US + (int)lroundf(offset);
+}
+
+
+void stopWithMessage(const char *message) {
+  centerServos();
+  Serial.println(message);
+
+
+  while (true) {
+    delay(100);
+  }
+}
+
+
+float topAccelAngle() {
+  return atan2f(-accel.zData, accel.yData) * RAD_TO_DEG_F;
+}
+
+
+float rightAccelAngle() {
+  return atan2f(
+    accel.xData,
+    sqrtf(
+      accel.yData * accel.yData +
+      accel.zData * accel.zData
+    )
+  ) * RAD_TO_DEG_F;
+}
+
+
+float updateKalman(
+  AngleFilter &f,
+  float measuredAngle,
+  float gyroRate,
+  float dt,
+  float measurementVariance
+) {
+  float rate = gyroRate - f.bias;
+  f.angle += dt * rate;
+
+
+  f.p00 += dt * (
+    dt * f.p11 - f.p01 - f.p10 + Q_ANGLE
+  );
+  f.p01 -= dt * f.p11;
+  f.p10 -= dt * f.p11;
+  f.p11 += Q_BIAS * dt;
+
+
+  float innovation = measuredAngle - f.angle;
+
+
+  while (innovation > 180.0f) innovation -= 360.0f;
+  while (innovation < -180.0f) innovation += 360.0f;
+
+
+  float innovationVariance = f.p00 + measurementVariance;
+  float k0 = f.p00 / innovationVariance;
+  float k1 = f.p10 / innovationVariance;
+
+
+  f.angle += k0 * innovation;
+  f.bias += k1 * innovation;
+
+
+  float oldP00 = f.p00;
+  float oldP01 = f.p01;
+
+
+  f.p00 -= k0 * oldP00;
+  f.p01 -= k0 * oldP01;
+  f.p10 -= k1 * oldP00;
+  f.p11 -= k1 * oldP01;
+
+
+  return f.angle;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+
+  finRight.attach(2);
+  finBottom.attach(3);
+  finTop.attach(4);
+  finLeft.attach(5);
+  centerServos();
+
+
+  unsigned long serialStart = millis();
+  while (!Serial && millis() - serialStart < 2000) {
+    delay(10);
+  }
+
+
+  Wire2.begin();
+
+
+  if (!imu.begin(Wire2)) {
+    stopWithMessage("IMU not found. Servos centered.");
+  }
+
+
+  imu.deviceReset();
+
+
+  unsigned long resetStart = millis();
+  while (!imu.getDeviceReset()) {
+    if (millis() - resetStart > 2000) {
+      stopWithMessage("IMU reset timeout. Servos centered.");
+    }
+    delay(1);
+  }
+
+
+  imu.setDeviceConfig();
+  imu.setBlockDataUpdate();
+
+
+  imu.setAccelDataRate(ISM_XL_ODR_104Hz);
+  imu.setAccelFullScale(ISM_4g);
+
+
+  imu.setGyroDataRate(ISM_GY_ODR_104Hz);
+  imu.setGyroFullScale(ISM_500dps);
+
+
+  imu.setAccelFilterLP2();
+  imu.setAccelSlopeFilter(ISM_LP_ODR_DIV_100);
+  imu.setGyroFilterLP1();
+  imu.setGyroLP1Bandwidth(ISM_MEDIUM);
+
+
+  Serial.println("KEEP STILL: gyro calibration starting.");
+  delay(1500);
+
+
+  float sumX = 0;
+  float sumZ = 0;
+  int samples = 0;
+
+
+  unsigned long calibrationStart = millis();
+
+
+  while (samples < 200) {
+    if (millis() - calibrationStart > 8000) {
+      stopWithMessage("Calibration timeout. Servos centered.");
+    }
+
+
+    if (imu.checkStatus() && imu.getGyro(&gyro)) {
+      sumX += gyro.xData * MDPS_TO_DPS;
+      sumZ += gyro.zData * MDPS_TO_DPS;
+      samples++;
+    }
+
+
+    delay(10);
+  }
+
+
+  gyroOffsetX = sumX / samples;
+  gyroOffsetZ = sumZ / samples;
+
+
+  if (!imu.getAccel(&accel)) {
+    stopWithMessage("Accel read failed. Servos centered.");
+  }
+
+
+  topFilter.angle = topAccelAngle();
+  rightFilter.angle = rightAccelAngle();
+
+
+  lastSampleUs = micros();
+  lastGoodMs = millis();
+
+
+  Serial.println("Ready. Bench servo control enabled.");
+  Serial.println("Positive Top = nose toward TOP.");
+  Serial.println("Positive Right = nose toward RIGHT.");
+}
+
+
+void loop() {
+  if (imu.checkStatus()) {
+    bool accelOK = imu.getAccel(&accel);
+    bool gyroOK = imu.getGyro(&gyro);
+
+
+    if (accelOK && gyroOK) {
+      unsigned long nowUs = micros();
+      float dt = (nowUs - lastSampleUs) * 0.000001f;
+      lastSampleUs = nowUs;
+      lastGoodMs = millis();
+
+
+      float accelTop = topAccelAngle();
+      float accelRight = rightAccelAngle();
+
+
+      // Reinitialize after a long sample interruption.
+      if (dt <= 0.0f || dt > 0.1f) {
+        topFilter = {};
+        rightFilter = {};
+        topFilter.angle = accelTop;
+        rightFilter.angle = accelRight;
+        centerServos();
+        delay(20);
+        return;
+      }
+
+
+      // Near-upright tilt rates for the measured mounting.
+      float topRate =
+        gyro.xData * MDPS_TO_DPS - gyroOffsetX;
+
+
+      float rightRate =
+        gyro.zData * MDPS_TO_DPS - gyroOffsetZ;
+
+
+      float accelMagnitude = sqrtf(
+        accel.xData * accel.xData +
+        accel.yData * accel.yData +
+        accel.zData * accel.zData
+      );
+
+      float measurementVariance =
+        fabsf(accelMagnitude - 1000.0f) > 100.0f
+        ? 0.5f : 0.1f;
+
+
+      float topTilt = updateKalman(
+        topFilter, accelTop, topRate, dt, measurementVariance
+      );
+
+
+      float rightTilt = updateKalman(
+        rightFilter, accelRight, rightRate, dt,
+        measurementVariance
+      );
+
+
+      // Positive outputs request trailing edges toward top/right.
+      // Negative outputs request trailing edges toward bottom/left.
+      float topOutput =
+        -KP * topTilt - KD * (topRate - topFilter.bias);
+
+
+      float rightOutput =
+        -KP * rightTilt - KD * (rightRate - rightFilter.bias);
+
+
+      // Right/left fins handle TOP/BOTTOM tilt.
+      int rightCmd = servoCommand(-SERVO_GAIN * topOutput);
+      int leftCmd  = servoCommand( SERVO_GAIN * topOutput);
+
+
+      // Top/bottom fins handle RIGHT/LEFT tilt.
+      int topCmd    = servoCommand( SERVO_GAIN * rightOutput);
+      int bottomCmd = servoCommand(-SERVO_GAIN * rightOutput);
+
+
+      finRight.writeMicroseconds(rightCmd);
+      finBottom.writeMicroseconds(bottomCmd);
+      finTop.writeMicroseconds(topCmd);
+      finLeft.writeMicroseconds(leftCmd);
+
+
+      if (Serial && millis() - lastPrintMs >= 100) {
+        lastPrintMs = millis();
+
+
+        Serial.print("Top: ");
+        Serial.print(topTilt, 2);
+        Serial.print(" Right: ");
+        Serial.print(rightTilt, 2);
+
+
+        Serial.print(" | TopRate: ");
+        Serial.print(topRate, 2);
+        Serial.print(" RightRate: ");
+        Serial.print(rightRate, 2);
+
+
+        Serial.print(" | Pin2(right): ");
+        Serial.print(rightCmd);
+        Serial.print(" Pin3(bottom): ");
+        Serial.print(bottomCmd);
+        Serial.print(" Pin4(top): ");
+        Serial.print(topCmd);
+        Serial.print(" Pin5(left): ");
+        Serial.println(leftCmd);
+      }
+    }
+  }
+
+
+  if (millis() - lastGoodMs > 100) {
+    centerServos();
+  }
+
+
+  delay(20);
+}
